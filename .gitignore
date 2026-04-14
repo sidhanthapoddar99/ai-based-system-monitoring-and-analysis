@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Log outputs — keep folders via .gitkeep, ignore contents
+logs/reports/*
+logs/analysis/*
+!logs/reports/.gitkeep
+!logs/analysis/.gitkeep
