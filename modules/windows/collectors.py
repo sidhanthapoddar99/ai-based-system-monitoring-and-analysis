@@ -2,12 +2,15 @@ import platform
 import subprocess
 import socket
 import json
+import os
+from datetime import datetime
+from pathlib import Path
 
 import psutil
 
 from modules.base import (
     SystemInfo, RamReport, CpuReport, TemperatureReport,
-    DiskReport, ProcessReport, DisplayReport,
+    DiskReport, ProcessReport, DisplayReport, StabilityReport, WslReport,
 )
 
 
@@ -32,11 +35,23 @@ def _run_ps_json(script: str, timeout: int = 15):
         return None
 
 
+def _run_cmd(cmd: list[str], timeout: int = 10) -> str:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
+
+
 def collect_system_info() -> SystemInfo:
     uname = platform.uname()
     cpu_info = _run_ps(
         "(Get-CimInstance Win32_Processor).Name"
     ) or uname.processor
+
+    boot = psutil.boot_time()
+    uptime = psutil.time.time() - boot if boot else None
+    boot_str = datetime.fromtimestamp(boot).isoformat() if boot else None
 
     return SystemInfo(
         hostname=socket.gethostname(),
@@ -46,6 +61,8 @@ def collect_system_info() -> SystemInfo:
         cpu_cores=psutil.cpu_count(logical=False) or 0,
         cpu_threads=psutil.cpu_count(logical=True) or 0,
         total_ram_gb=round(psutil.virtual_memory().total / (1024**3), 1),
+        uptime_seconds=round(uptime, 0) if uptime else None,
+        boot_time=boot_str,
     )
 
 
@@ -57,7 +74,9 @@ def collect_ram() -> RamReport:
         "Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory | "
         "Select-Object PoolNonpagedBytes, PoolPagedBytes, CommittedBytes, "
         "CacheBytes, ModifiedPageListBytes, StandbyCacheNormalPriorityBytes, "
-        "StandbyCacheReserveBytes, FreeAndZeroPageListBytes"
+        "StandbyCacheReserveBytes, FreeAndZeroPageListBytes, "
+        "PageFaultsPersec, PoolNonpagedAllocs, PoolPagedAllocs, "
+        "PoolNonpagedAllocsFailures, PoolPagedAllocsFailures"
     )
     if perf:
         details["nonpaged_pool_mb"] = round(int(perf.get("PoolNonpagedBytes", 0)) / (1024**2))
@@ -69,6 +88,7 @@ def collect_ram() -> RamReport:
         standby_reserve = int(perf.get("StandbyCacheReserveBytes", 0))
         details["standby_cache_gb"] = round((standby_normal + standby_reserve) / (1024**3), 2)
         details["free_zero_gb"] = round(int(perf.get("FreeAndZeroPageListBytes", 0)) / (1024**3), 2)
+        details["page_faults_per_sec"] = int(perf.get("PageFaultsPersec", 0))
 
     return RamReport(
         total_gb=round(vm.total / (1024**3), 1),
@@ -86,11 +106,16 @@ def collect_cpu(sample_seconds: int = 2) -> CpuReport:
     interrupts = None
     interrupt_pct = None
     dpc_pct = None
+    ctx_switches = None
+    sys_calls = None
 
     counter_script = (
         f"(Get-Counter '\\Processor(_Total)\\Interrupts/sec',"
         f"'\\Processor(_Total)\\% Interrupt Time',"
-        f"'\\Processor(_Total)\\% DPC Time' "
+        f"'\\Processor(_Total)\\% DPC Time',"
+        f"'\\System\\Context Switches/sec',"
+        f"'\\System\\System Calls/sec',"
+        f"'\\System\\Processor Queue Length' "
         f"-SampleInterval {sample_seconds} -MaxSamples 1)"
         f".CounterSamples | ForEach-Object {{ "
         f"[PSCustomObject]@{{Path=$_.Path;Value=$_.CookedValue}} "
@@ -102,6 +127,7 @@ def collect_cpu(sample_seconds: int = 2) -> CpuReport:
             samples = json.loads(raw)
             if isinstance(samples, dict):
                 samples = [samples]
+            details = {}
             for s in samples:
                 path = s.get("Path", "").lower()
                 val = s.get("Value", 0)
@@ -111,8 +137,14 @@ def collect_cpu(sample_seconds: int = 2) -> CpuReport:
                     interrupt_pct = round(val, 3)
                 elif "% dpc time" in path:
                     dpc_pct = round(val, 3)
+                elif "context switches" in path:
+                    ctx_switches = round(val, 0)
+                elif "system calls" in path:
+                    sys_calls = round(val, 0)
+                elif "processor queue" in path:
+                    details["processor_queue_length"] = round(val, 1)
         except json.JSONDecodeError:
-            pass
+            details = {}
 
     clock = None
     clock_raw = _run_ps("(Get-CimInstance Win32_Processor).CurrentClockSpeed")
@@ -126,13 +158,15 @@ def collect_cpu(sample_seconds: int = 2) -> CpuReport:
         interrupts_per_sec=interrupts,
         interrupt_time_percent=interrupt_pct,
         dpc_time_percent=dpc_pct,
+        context_switches_per_sec=ctx_switches,
+        system_calls_per_sec=sys_calls,
+        details=details if 'details' in dir() else {},
     )
 
 
 def collect_temperatures() -> TemperatureReport:
     readings = []
 
-    # Try WMI thermal zones (needs admin for MSAcpi)
     data = _run_ps_json(
         "Get-CimInstance Win32_PerfFormattedData_Counters_ThermalZoneInformation -ErrorAction SilentlyContinue | "
         "Select-Object Name, Temperature"
@@ -152,7 +186,6 @@ def collect_temperatures() -> TemperatureReport:
                 })
         return TemperatureReport(readings=readings, source="Win32_ThermalZoneInformation")
 
-    # Fallback: psutil (limited on Windows)
     try:
         temps = psutil.sensors_temperatures()
         if temps:
@@ -245,7 +278,6 @@ def collect_processes(top_n: int = 20) -> ProcessReport:
     by_ram = sorted(procs, key=lambda x: x["ram_mb"], reverse=True)[:top_n]
     by_cpu = sorted(procs, key=lambda x: x["cpu_seconds"], reverse=True)[:top_n]
 
-    # Group by name
     groups = {}
     for p in procs:
         name = p["name"]
@@ -291,3 +323,235 @@ def collect_display() -> DisplayReport:
                 "driver_version": entry.get("DriverVersion", "unknown"),
             })
     return DisplayReport(displays=displays)
+
+
+def collect_stability() -> StabilityReport:
+    uptime = None
+    boot = psutil.boot_time()
+    if boot:
+        import time
+        uptime = round((time.time() - boot) / 3600, 2)
+
+    # Check for BSOD minidumps
+    bsod_dumps = []
+    minidump_dir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Minidump"
+    if minidump_dir.exists():
+        for dump in sorted(minidump_dir.glob("*.dmp"), key=lambda f: f.stat().st_mtime, reverse=True)[:10]:
+            bsod_dumps.append({
+                "file": dump.name,
+                "date": datetime.fromtimestamp(dump.stat().st_mtime).isoformat(),
+                "size_kb": round(dump.stat().st_size / 1024),
+            })
+
+    # Also check for full memory dumps
+    full_dump = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "MEMORY.DMP"
+    if full_dump.exists():
+        bsod_dumps.insert(0, {
+            "file": "MEMORY.DMP",
+            "date": datetime.fromtimestamp(full_dump.stat().st_mtime).isoformat(),
+            "size_kb": round(full_dump.stat().st_size / 1024),
+        })
+
+    # Critical kernel errors from event log (last 48 hours)
+    kernel_errors = []
+    event_script = (
+        "Get-WinEvent -FilterHashtable @{LogName='System';Level=1,2;"
+        "StartTime=(Get-Date).AddHours(-48)} -MaxEvents 20 -ErrorAction SilentlyContinue | "
+        "Select-Object TimeCreated, Id, ProviderName, Message | "
+        "ForEach-Object { [PSCustomObject]@{"
+        "Time=$_.TimeCreated.ToString('o');"
+        "Id=$_.Id;"
+        "Source=$_.ProviderName;"
+        "Msg=$_.Message.Substring(0, [Math]::Min(200, $_.Message.Length))"
+        "} }"
+    )
+    events = _run_ps_json(event_script, timeout=20)
+    if events:
+        if isinstance(events, dict):
+            events = [events]
+        for e in events:
+            kernel_errors.append({
+                "time": e.get("Time", ""),
+                "event_id": e.get("Id", 0),
+                "source": e.get("Source", ""),
+                "message": e.get("Msg", ""),
+            })
+
+    # Page faults, pool failures, handle/thread counts
+    page_faults = None
+    pool_fail_np = None
+    pool_fail_p = None
+
+    perf = _run_ps_json(
+        "Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory | "
+        "Select-Object PageFaultsPersec"
+    )
+    if perf:
+        page_faults = int(perf.get("PageFaultsPersec", 0))
+
+    # System-wide handle and thread count
+    handle_count = None
+    thread_count = None
+    process_count = None
+    sys_perf = _run_ps_json(
+        "Get-CimInstance Win32_PerfFormattedData_PerfOS_System | "
+        "Select-Object Threads, Processes, SystemCallsPersec"
+    )
+    if sys_perf:
+        thread_count = int(sys_perf.get("Threads", 0))
+        process_count = int(sys_perf.get("Processes", 0))
+
+    # Handle count from all processes
+    try:
+        handle_count = sum(p.num_handles() for p in psutil.process_iter() if hasattr(p, 'num_handles'))
+    except Exception:
+        pass
+
+    details = {}
+    # Check if secure boot / bitlocker / crash config
+    crash_cfg = _run_ps_json(
+        "Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\CrashControl' -ErrorAction SilentlyContinue | "
+        "Select-Object CrashDumpEnabled, AutoReboot"
+    )
+    if crash_cfg:
+        dump_types = {0: "None", 1: "Complete", 2: "Kernel", 3: "Small (Minidump)", 7: "Automatic"}
+        details["crash_dump_type"] = dump_types.get(crash_cfg.get("CrashDumpEnabled", -1), "Unknown")
+        details["auto_reboot_on_crash"] = bool(crash_cfg.get("AutoReboot", 0))
+
+    return StabilityReport(
+        uptime_hours=uptime,
+        bsod_dumps=bsod_dumps,
+        kernel_errors=kernel_errors,
+        page_faults_per_sec=page_faults,
+        pool_failures_nonpaged=pool_fail_np,
+        pool_failures_paged=pool_fail_p,
+        handle_count=handle_count,
+        thread_count=thread_count,
+        process_count=process_count,
+        details=details,
+    )
+
+
+def collect_wsl() -> WslReport:
+    """Collect WSL distro details from the Windows host side."""
+    distros = []
+    details = {}
+
+    # Get running distros
+    raw = _run_cmd(["wsl", "--list", "--verbose"], timeout=10)
+    if not raw:
+        return WslReport(distros=[], details={"available": False})
+
+    # Parse the wsl --list output (has weird Unicode spacing)
+    lines = raw.splitlines()
+    for line in lines[1:]:  # skip header
+        # Normalize whitespace (WSL outputs UTF-16 with extra null bytes)
+        clean = line.replace("\x00", "").strip()
+        if not clean:
+            continue
+        is_default = clean.startswith("*")
+        clean = clean.lstrip("* ").strip()
+        parts = clean.split()
+        if len(parts) >= 3:
+            name = parts[0]
+            state = parts[1]
+            version = parts[2] if len(parts) > 2 else "?"
+            distros.append({
+                "name": name,
+                "state": state,
+                "wsl_version": version,
+                "is_default": is_default,
+            })
+
+    # For each running distro, collect details from inside
+    for distro in distros:
+        if distro["state"].lower() != "running":
+            continue
+        dname = distro["name"]
+
+        # Memory from inside WSL
+        meminfo = _run_cmd(["wsl", "-d", dname, "--", "cat", "/proc/meminfo"], timeout=5)
+        if meminfo:
+            for mline in meminfo.splitlines():
+                if mline.startswith("MemTotal:"):
+                    distro["total_ram_mb"] = round(int(mline.split()[1]) / 1024)
+                elif mline.startswith("MemAvailable:"):
+                    distro["available_ram_mb"] = round(int(mline.split()[1]) / 1024)
+                elif mline.startswith("MemFree:"):
+                    distro["free_ram_mb"] = round(int(mline.split()[1]) / 1024)
+
+            if "total_ram_mb" in distro and "available_ram_mb" in distro:
+                distro["ram_mb"] = distro["total_ram_mb"] - distro["available_ram_mb"]
+                distro["ram_percent"] = round(distro["ram_mb"] / distro["total_ram_mb"] * 100, 1)
+
+        # Load average
+        loadavg = _run_cmd(["wsl", "-d", dname, "--", "cat", "/proc/loadavg"], timeout=5)
+        if loadavg:
+            parts = loadavg.split()
+            if len(parts) >= 3:
+                distro["load_avg_1m"] = float(parts[0])
+                distro["load_avg_5m"] = float(parts[1])
+                distro["load_avg_15m"] = float(parts[2])
+
+        # OOM kills from dmesg (if accessible)
+        dmesg = _run_cmd(["wsl", "-d", dname, "--", "dmesg"], timeout=5)
+        if dmesg:
+            oom_count = dmesg.lower().count("out of memory")
+            distro["oom_kills"] = oom_count
+            # Kernel panics
+            panic_count = dmesg.lower().count("kernel panic")
+            distro["kernel_panics"] = panic_count
+
+        # Top processes inside WSL
+        ps_output = _run_cmd([
+            "wsl", "-d", dname, "--",
+            "ps", "aux", "--sort=-rss"
+        ], timeout=5)
+        if ps_output:
+            top_procs = []
+            lines = ps_output.splitlines()
+            for pline in lines[1:11]:  # top 10
+                parts = pline.split(None, 10)
+                if len(parts) >= 11:
+                    top_procs.append({
+                        "user": parts[0],
+                        "pid": int(parts[1]),
+                        "cpu_pct": float(parts[2]),
+                        "mem_pct": float(parts[3]),
+                        "rss_kb": int(parts[5]),
+                        "command": parts[10][:80],
+                    })
+            distro["top_processes"] = top_procs
+
+        # Disk usage inside WSL
+        df_output = _run_cmd(["wsl", "-d", dname, "--", "df", "-h", "/"], timeout=5)
+        if df_output:
+            lines = df_output.splitlines()
+            if len(lines) >= 2:
+                distro["disk_info"] = lines[1].strip()
+
+    # Check .wslconfig
+    wslconfig = Path.home() / ".wslconfig"
+    if wslconfig.exists():
+        details["wslconfig"] = wslconfig.read_text().strip()
+        details["wslconfig_path"] = str(wslconfig)
+    else:
+        details["wslconfig"] = None
+        details["wslconfig_note"] = "No .wslconfig found — WSL uses defaults (up to 50% of host RAM)"
+
+    # Get vmmem process info from Windows side
+    vmmem_procs = []
+    for p in psutil.process_iter(["pid", "name", "memory_info"]):
+        try:
+            if "vmmem" in (p.info["name"] or "").lower():
+                mem = p.info["memory_info"]
+                vmmem_procs.append({
+                    "pid": p.info["pid"],
+                    "name": p.info["name"],
+                    "ram_mb": round(mem.rss / (1024**2), 1) if mem else 0,
+                })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    details["vmmem_processes"] = vmmem_procs
+
+    return WslReport(distros=distros, details=details)

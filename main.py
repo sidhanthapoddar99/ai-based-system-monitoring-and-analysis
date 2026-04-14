@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """Cross-platform system diagnostics tool.
 
-Collects RAM, CPU, interrupts, temperatures, disk, process, and display data.
-Detects anomalies and generates reports.
-
 Usage:
-    python main.py                  # Full run: collect + report + analysis
-    python main.py --report-only    # Collect and save raw report (JSON), skip analysis
-    python main.py --analyze-only   # Print analysis to terminal, no files written
-    python main.py --section ram    # Collect and print only one section
-    python main.py --section cpu
-    python main.py --section disk
-    python main.py --section temps
-    python main.py --section processes
-    python main.py --section display
+    python main.py                      # Full run: collect + report + analysis
+    python main.py --report-only        # Save raw JSON report only
+    python main.py --analyze-only       # Print analysis to terminal, no files
+    python main.py --section ram        # Print one section as JSON
+    python main.py --section stability  # Crash indicators, BSOD, kernel errors
+    python main.py --section wsl        # WSL distro details (Windows only)
+    python main.py --view latest        # Pretty-print latest report JSON
+    python main.py --view <path>        # Pretty-print a specific report JSON
+    python main.py --view latest --jq '.ram.details'  # Filter with jq syntax
 """
 
 import argparse
@@ -70,11 +67,21 @@ def collect_all(collectors):
     display = collectors.collect_display()
     print("done")
 
-    return system, ram, cpu, temps, disk, processes, display
+    print("Collecting stability metrics...", end=" ", flush=True)
+    stability = collectors.collect_stability()
+    print("done")
+
+    wsl = None
+    if platform.system() == "Windows" and hasattr(collectors, "collect_wsl"):
+        print("Collecting WSL details...", end=" ", flush=True)
+        wsl = collectors.collect_wsl()
+        print("done")
+
+    return system, ram, cpu, temps, disk, processes, display, stability, wsl
 
 
-def format_report_json(timestamp, system, ram, cpu, temps, disk, processes, display):
-    return {
+def format_report_json(timestamp, system, ram, cpu, temps, disk, processes, display, stability, wsl):
+    report = {
         "timestamp": timestamp,
         "system": asdict(system),
         "ram": asdict(ram),
@@ -83,10 +90,15 @@ def format_report_json(timestamp, system, ram, cpu, temps, disk, processes, disp
         "disk": asdict(disk),
         "processes": asdict(processes),
         "display": asdict(display),
+        "stability": asdict(stability),
     }
+    if wsl:
+        report["wsl"] = asdict(wsl)
+    return report
 
 
-def format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk, processes, display):
+def format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
+                       processes, display, stability, wsl):
     lines = [
         f"# System Analysis — {timestamp}",
         "",
@@ -94,14 +106,23 @@ def format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk, proc
         f"**OS:** {system.os_name} ({system.os_version})  ",
         f"**CPU:** {system.cpu_model} ({system.cpu_cores}C/{system.cpu_threads}T)  ",
         f"**RAM:** {system.total_ram_gb} GB  ",
-        "",
     ]
+    if system.uptime_seconds:
+        hours = system.uptime_seconds / 3600
+        days = hours / 24
+        if days >= 1:
+            lines.append(f"**Uptime:** {days:.1f} days ({hours:.0f} hours)  ")
+        else:
+            lines.append(f"**Uptime:** {hours:.1f} hours  ")
+    if system.boot_time:
+        lines.append(f"**Boot Time:** {system.boot_time}  ")
+    lines.append("")
 
-    # Summary
+    # Summary table
     lines.append("## Quick Summary")
     lines.append("")
-    lines.append(f"| Metric | Value |")
-    lines.append(f"|---|---|")
+    lines.append("| Metric | Value |")
+    lines.append("|---|---|")
     lines.append(f"| RAM Used | {ram.used_gb} GB / {ram.total_gb} GB ({ram.percent_used}%) |")
     lines.append(f"| CPU Load | {cpu.load_percent}% |")
     if cpu.interrupts_per_sec is not None:
@@ -110,32 +131,85 @@ def format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk, proc
         lines.append(f"| % Interrupt Time | {cpu.interrupt_time_percent:.2f}% |")
     if cpu.dpc_time_percent is not None:
         lines.append(f"| % DPC Time | {cpu.dpc_time_percent:.2f}% |")
+    if cpu.context_switches_per_sec is not None:
+        lines.append(f"| Context Switches/sec | {cpu.context_switches_per_sec:,.0f} |")
+    if cpu.system_calls_per_sec is not None:
+        lines.append(f"| System Calls/sec | {cpu.system_calls_per_sec:,.0f} |")
+    if cpu.details.get("processor_queue_length") is not None:
+        lines.append(f"| Processor Queue Length | {cpu.details['processor_queue_length']} |")
+    if cpu.details.get("load_avg_1m") is not None:
+        lines.append(f"| Load Average (1/5/15m) | {cpu.details['load_avg_1m']}/{cpu.details['load_avg_5m']}/{cpu.details['load_avg_15m']} |")
     if temps.readings:
-        max_temp = max(r.get("current_c", 0) for r in temps.readings if r.get("current_c"))
-        lines.append(f"| Max Temperature | {max_temp:.0f}°C |")
+        valid = [r.get("current_c", 0) for r in temps.readings if r.get("current_c")]
+        if valid:
+            lines.append(f"| Max Temperature | {max(valid):.0f}°C |")
     lines.append(f"| Process RAM Total | {processes.total_process_ram_gb} GB |")
+    if stability.process_count:
+        lines.append(f"| Process Count | {stability.process_count} |")
+    if stability.handle_count:
+        lines.append(f"| System Handle Count | {stability.handle_count:,} |")
+    if stability.thread_count:
+        lines.append(f"| System Thread Count | {stability.thread_count:,} |")
+    if stability.page_faults_per_sec is not None:
+        lines.append(f"| Page Faults/sec | {stability.page_faults_per_sec:,} |")
     lines.append("")
 
     # Anomalies
     if anomalies:
         lines.append("## Anomalies Detected")
         lines.append("")
-
-        critical = [a for a in anomalies if a.severity == "critical"]
-        warnings = [a for a in anomalies if a.severity == "warning"]
-        infos = [a for a in anomalies if a.severity == "info"]
-
-        for label, group in [("CRITICAL", critical), ("WARNING", warnings), ("INFO", infos)]:
-            if group:
-                for a in group:
-                    icon = {"CRITICAL": "[!!!]", "WARNING": "[!!]", "INFO": "[i]"}[label]
-                    lines.append(f"- **{icon} {label}** [{a.category}] {a.message}")
+        for label, group in [
+            ("CRITICAL", [a for a in anomalies if a.severity == "critical"]),
+            ("WARNING", [a for a in anomalies if a.severity == "warning"]),
+            ("INFO", [a for a in anomalies if a.severity == "info"]),
+        ]:
+            for a in group:
+                icon = {"CRITICAL": "[!!!]", "WARNING": "[!!]", "INFO": "[i]"}[label]
+                lines.append(f"- **{icon} {label}** [{a.category}] {a.message}")
         lines.append("")
     else:
         lines.append("## No Anomalies Detected")
         lines.append("")
         lines.append("All metrics within normal ranges.")
         lines.append("")
+
+    # Stability
+    lines.append("## Stability")
+    lines.append("")
+    if stability.uptime_hours:
+        lines.append(f"**Uptime:** {stability.uptime_hours:.1f} hours")
+    if stability.bsod_dumps:
+        lines.append("")
+        lines.append(f"### BSOD / Crash Dumps ({len(stability.bsod_dumps)} found)")
+        lines.append("")
+        lines.append("| File | Date | Size (KB) |")
+        lines.append("|---|---|---|")
+        for d in stability.bsod_dumps:
+            lines.append(f"| {d['file']} | {d['date']} | {d['size_kb']} |")
+    else:
+        lines.append("")
+        lines.append("No crash dumps found.")
+    if stability.kernel_errors:
+        lines.append("")
+        lines.append(f"### Kernel/System Errors (last 48h) — {len(stability.kernel_errors)} events")
+        lines.append("")
+        for e in stability.kernel_errors[:10]:
+            src = e.get("source", "")
+            eid = e.get("event_id", "")
+            msg = e.get("message", e.get("msg", ""))
+            time_str = e.get("time", "")
+            if src:
+                lines.append(f"- `[{time_str}]` **{src}** (ID:{eid}): {msg}")
+            else:
+                lines.append(f"- {msg}")
+        if len(stability.kernel_errors) > 10:
+            lines.append(f"- ... and {len(stability.kernel_errors) - 10} more")
+    if stability.details:
+        if stability.details.get("crash_dump_type"):
+            lines.append(f"\n**Crash dump config:** {stability.details['crash_dump_type']}")
+        if stability.details.get("auto_reboot_on_crash") is not None:
+            lines.append(f"**Auto-reboot on crash:** {stability.details['auto_reboot_on_crash']}")
+    lines.append("")
 
     # RAM details
     if ram.details:
@@ -165,7 +239,6 @@ def format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk, proc
                 f"{p['used_gb']} | {p['free_gb']} | {p['percent']}% |"
             )
         lines.append("")
-
     if disk.io:
         lines.append("### Disk I/O")
         lines.append("")
@@ -247,31 +320,133 @@ def format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk, proc
             lines.append(f"| {r.get('label', '?')} | {curr} | {high} | {crit} |")
         lines.append("")
 
+    # WSL
+    if wsl and wsl.distros:
+        lines.append("## WSL Distros")
+        lines.append("")
+        for distro in wsl.distros:
+            default_mark = " (default)" if distro.get("is_default") else ""
+            lines.append(f"### {distro['name']}{default_mark}")
+            lines.append("")
+            lines.append(f"- **State:** {distro.get('state', '?')}")
+            lines.append(f"- **WSL Version:** {distro.get('wsl_version', '?')}")
+            if "ram_mb" in distro:
+                lines.append(f"- **RAM Used:** {distro['ram_mb']} MB / {distro.get('total_ram_mb', '?')} MB ({distro.get('ram_percent', '?')}%)")
+            if "load_avg_1m" in distro:
+                lines.append(f"- **Load Average:** {distro['load_avg_1m']} / {distro['load_avg_5m']} / {distro['load_avg_15m']}")
+            if distro.get("oom_kills", 0) > 0:
+                lines.append(f"- **OOM Kills:** {distro['oom_kills']}")
+            if distro.get("kernel_panics", 0) > 0:
+                lines.append(f"- **Kernel Panics:** {distro['kernel_panics']}")
+            if distro.get("disk_info"):
+                lines.append(f"- **Disk:** {distro['disk_info']}")
+            if distro.get("top_processes"):
+                lines.append("")
+                lines.append("| User | PID | CPU% | MEM% | RSS (KB) | Command |")
+                lines.append("|---|---|---|---|---|---|")
+                for p in distro["top_processes"][:10]:
+                    lines.append(
+                        f"| {p['user']} | {p['pid']} | {p['cpu_pct']} | "
+                        f"{p['mem_pct']} | {p['rss_kb']} | {p['command']} |"
+                    )
+            lines.append("")
+
+        # vmmem info
+        vmmem = wsl.details.get("vmmem_processes", [])
+        if vmmem:
+            lines.append("### Host-side VM Memory (vmmem)")
+            lines.append("")
+            for v in vmmem:
+                lines.append(f"- **{v['name']}** (PID {v['pid']}): {v['ram_mb']} MB")
+            lines.append("")
+
+        # .wslconfig
+        if wsl.details.get("wslconfig"):
+            lines.append("### .wslconfig")
+            lines.append("")
+            lines.append("```ini")
+            lines.append(wsl.details["wslconfig"])
+            lines.append("```")
+            lines.append("")
+        elif wsl.details.get("wslconfig_note"):
+            lines.append(f"> {wsl.details['wslconfig_note']}")
+            lines.append("")
+
     return "\n".join(lines)
 
 
 def print_section(collectors, section: str):
-    """Print a single section to terminal without saving files."""
-    if section == "ram":
-        data = collectors.collect_ram()
-    elif section == "cpu":
-        data = collectors.collect_cpu()
-    elif section == "temps":
-        data = collectors.collect_temperatures()
-    elif section == "disk":
-        data = collectors.collect_disk()
-    elif section == "processes":
-        data = collectors.collect_processes()
-    elif section == "display":
-        data = collectors.collect_display()
-    elif section == "system":
-        data = collectors.collect_system_info()
+    """Print a single section to terminal as JSON."""
+    collect_fn = {
+        "system": collectors.collect_system_info,
+        "ram": collectors.collect_ram,
+        "cpu": collectors.collect_cpu,
+        "temps": collectors.collect_temperatures,
+        "disk": collectors.collect_disk,
+        "processes": collectors.collect_processes,
+        "display": collectors.collect_display,
+        "stability": collectors.collect_stability,
+    }
+
+    if section == "wsl":
+        if not hasattr(collectors, "collect_wsl"):
+            print("WSL collection is only available on Windows.")
+            sys.exit(1)
+        data = collectors.collect_wsl()
+    elif section in collect_fn:
+        data = collect_fn[section]()
     else:
         print(f"Unknown section: {section}")
-        print("Available: system, ram, cpu, temps, disk, processes, display")
+        print(f"Available: {', '.join(list(collect_fn.keys()) + ['wsl'])}")
         sys.exit(1)
 
     print(json.dumps(asdict(data), indent=2, default=str))
+
+
+def view_report(path_or_latest: str, jq_filter: str | None = None):
+    """Pretty-print a report JSON file."""
+    base_dir = Path(__file__).parent / "logs" / "reports"
+
+    if path_or_latest == "latest":
+        reports = sorted(base_dir.glob("*_report.json"))
+        if not reports:
+            print("No reports found in logs/reports/")
+            sys.exit(1)
+        filepath = reports[-1]
+    else:
+        filepath = Path(path_or_latest)
+
+    if not filepath.exists():
+        print(f"File not found: {filepath}")
+        sys.exit(1)
+
+    if jq_filter:
+        # Use Python-based jq-like filtering
+        data = json.loads(filepath.read_text())
+        result = _jq_filter(data, jq_filter)
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        data = json.loads(filepath.read_text())
+        print(json.dumps(data, indent=2, default=str))
+
+
+def _jq_filter(data, filter_str: str):
+    """Simple jq-like dot notation filter (e.g., '.ram.details', '.cpu')."""
+    parts = filter_str.strip().lstrip(".").split(".")
+    result = data
+    for part in parts:
+        if not part:
+            continue
+        # Handle array index like [0]
+        if "[" in part:
+            key, idx = part.split("[", 1)
+            idx = int(idx.rstrip("]"))
+            if key:
+                result = result[key]
+            result = result[idx]
+        else:
+            result = result[part]
+    return result
 
 
 def main():
@@ -281,10 +456,19 @@ def main():
     parser.add_argument("--analyze-only", action="store_true",
                         help="Print analysis to terminal, don't save files")
     parser.add_argument("--section", type=str,
-                        help="Print a single section (ram, cpu, disk, temps, processes, display, system)")
+                        help="Print a single section (ram, cpu, disk, temps, processes, display, stability, wsl)")
+    parser.add_argument("--view", type=str,
+                        help="View a report JSON ('latest' or path)")
+    parser.add_argument("--jq", type=str,
+                        help="jq-style filter for --view (e.g., '.ram.details')")
     parser.add_argument("--top-n", type=int, default=20,
                         help="Number of top processes to include (default: 20)")
     args = parser.parse_args()
+
+    # View mode
+    if args.view:
+        view_report(args.view, args.jq)
+        return
 
     collectors = get_collectors()
 
@@ -294,38 +478,47 @@ def main():
         return
 
     # Full collection
-    system, ram, cpu, temps, disk, processes, display = collect_all(collectors)
+    system, ram, cpu, temps, disk, processes, display, stability, wsl = collect_all(collectors)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     base_dir = Path(__file__).parent
 
     # Run analysis
-    anomalies = analyze(system, ram, cpu, temps, disk, processes, display)
+    anomalies = analyze(system, ram, cpu, temps, disk, processes, display, stability, wsl)
 
-    # Print summary to terminal
+    # Print summary
     print(f"\n{'='*60}")
     print(f"  {system.hostname} — {system.os_name}")
     print(f"  {system.cpu_model}")
     print(f"  RAM: {ram.used_gb}/{ram.total_gb} GB ({ram.percent_used}%)")
     print(f"  CPU: {cpu.load_percent}%")
+    if cpu.interrupts_per_sec is not None:
+        print(f"  Interrupts: {cpu.interrupts_per_sec:,.0f}/sec")
+    if cpu.context_switches_per_sec is not None:
+        print(f"  Context Switches: {cpu.context_switches_per_sec:,.0f}/sec")
+    if stability.uptime_hours:
+        print(f"  Uptime: {stability.uptime_hours:.1f} hours")
+    if stability.bsod_dumps:
+        print(f"  BSOD Dumps: {len(stability.bsod_dumps)} found!")
     if anomalies:
         crit = sum(1 for a in anomalies if a.severity == "critical")
         warn = sum(1 for a in anomalies if a.severity == "warning")
         info = sum(1 for a in anomalies if a.severity == "info")
         print(f"  Anomalies: {crit} critical, {warn} warnings, {info} info")
     else:
-        print(f"  No anomalies detected")
+        print("  No anomalies detected")
     print(f"{'='*60}\n")
 
     if args.analyze_only:
-        # Print full analysis to terminal
-        md = format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk, processes, display)
+        md = format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
+                                processes, display, stability, wsl)
         print(md)
         return
 
     # Save raw report
     report_dir = base_dir / "logs" / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
-    report_data = format_report_json(timestamp, system, ram, cpu, temps, disk, processes, display)
+    report_data = format_report_json(timestamp, system, ram, cpu, temps, disk,
+                                     processes, display, stability, wsl)
     report_path = report_dir / f"{timestamp}_report.json"
     report_path.write_text(json.dumps(report_data, indent=2, default=str))
     print(f"Report saved: {report_path}")
@@ -336,7 +529,8 @@ def main():
     # Save analysis
     analysis_dir = base_dir / "logs" / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
-    analysis_md = format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk, processes, display)
+    analysis_md = format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
+                                     processes, display, stability, wsl)
     analysis_path = analysis_dir / f"{timestamp}_analysis.md"
     analysis_path.write_text(analysis_md, encoding="utf-8")
     print(f"Analysis saved: {analysis_path}")

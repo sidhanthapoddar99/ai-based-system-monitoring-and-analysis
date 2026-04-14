@@ -1,13 +1,15 @@
 import platform
 import socket
 import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 
 import psutil
 
 from modules.base import (
     SystemInfo, RamReport, CpuReport, TemperatureReport,
-    DiskReport, ProcessReport, DisplayReport,
+    DiskReport, ProcessReport, DisplayReport, StabilityReport,
 )
 
 
@@ -41,9 +43,12 @@ def collect_system_info() -> SystemInfo:
             cpu_model = line.split(":", 1)[1].strip()
             break
 
+    boot = psutil.boot_time()
+    uptime = time.time() - boot if boot else None
+    boot_str = datetime.fromtimestamp(boot).isoformat() if boot else None
+
     os_version = uname.release
     os_name = "WSL" if _is_wsl() else "Linux"
-    # Try to get distro info
     os_release = _read_file("/etc/os-release")
     for line in os_release.splitlines():
         if line.startswith("PRETTY_NAME="):
@@ -58,6 +63,8 @@ def collect_system_info() -> SystemInfo:
         cpu_cores=psutil.cpu_count(logical=False) or 0,
         cpu_threads=psutil.cpu_count(logical=True) or 0,
         total_ram_gb=round(psutil.virtual_memory().total / (1024**3), 1),
+        uptime_seconds=round(uptime, 0) if uptime else None,
+        boot_time=boot_str,
     )
 
 
@@ -97,15 +104,19 @@ def collect_cpu(sample_seconds: int = 2) -> CpuReport:
     per_core = psutil.cpu_percent(interval=sample_seconds, percpu=True)
     load = sum(per_core) / len(per_core) if per_core else 0.0
 
-    # Parse /proc/interrupts for total count
+    # Parse /proc/stat for interrupts and context switches
     interrupts = None
-    intr_data = _read_file("/proc/stat")
-    for line in intr_data.splitlines():
+    ctx_switches = None
+    stat_data = _read_file("/proc/stat")
+    for line in stat_data.splitlines():
         if line.startswith("intr "):
             parts = line.split()
             if len(parts) > 1:
                 interrupts = float(parts[1])
-            break
+        elif line.startswith("ctxt "):
+            parts = line.split()
+            if len(parts) > 1:
+                ctx_switches = float(parts[1])
 
     clock = None
     cpuinfo = _read_file("/proc/cpuinfo")
@@ -117,6 +128,15 @@ def collect_cpu(sample_seconds: int = 2) -> CpuReport:
                 pass
             break
 
+    details = {}
+    loadavg = _read_file("/proc/loadavg")
+    if loadavg:
+        parts = loadavg.split()
+        if len(parts) >= 3:
+            details["load_avg_1m"] = float(parts[0])
+            details["load_avg_5m"] = float(parts[1])
+            details["load_avg_15m"] = float(parts[2])
+
     return CpuReport(
         load_percent=round(load, 1),
         per_core_percent=[round(c, 1) for c in per_core],
@@ -124,6 +144,8 @@ def collect_cpu(sample_seconds: int = 2) -> CpuReport:
         interrupts_per_sec=interrupts,
         interrupt_time_percent=None,
         dpc_time_percent=None,
+        context_switches_per_sec=ctx_switches,
+        details=details,
     )
 
 
@@ -272,3 +294,77 @@ def collect_display() -> DisplayReport:
                                 pass
                             break
     return DisplayReport(displays=displays)
+
+
+def collect_stability() -> StabilityReport:
+    uptime = None
+    boot = psutil.boot_time()
+    if boot:
+        uptime = round((time.time() - boot) / 3600, 2)
+
+    # OOM kills and kernel panics from dmesg
+    kernel_errors = []
+    oom_kills = 0
+    dmesg = _run_cmd(["dmesg", "--level=emerg,alert,crit,err"], timeout=5)
+    if dmesg:
+        for line in dmesg.splitlines()[-20:]:
+            if "out of memory" in line.lower():
+                oom_kills += 1
+            kernel_errors.append({"message": line.strip()[:200]})
+
+    # Check /var/log/kern.log or journalctl
+    if not kernel_errors:
+        journal = _run_cmd(["journalctl", "-p", "err", "-n", "20", "--no-pager"], timeout=5)
+        if journal:
+            for line in journal.splitlines():
+                if line.startswith("--"):
+                    continue
+                kernel_errors.append({"message": line.strip()[:200]})
+
+    # Page faults from /proc/vmstat
+    page_faults = None
+    vmstat = _read_file("/proc/vmstat")
+    for line in vmstat.splitlines():
+        if line.startswith("pgfault "):
+            page_faults = int(line.split()[1])
+            break
+
+    # Handle/thread/process count
+    handle_count = None
+    thread_count = None
+    process_count = None
+    try:
+        process_count = len(list(psutil.process_iter()))
+    except Exception:
+        pass
+
+    file_nr = _read_file("/proc/sys/fs/file-nr")
+    if file_nr:
+        parts = file_nr.split()
+        if parts:
+            handle_count = int(parts[0])
+
+    details = {}
+    # Load average
+    loadavg = _read_file("/proc/loadavg")
+    if loadavg:
+        parts = loadavg.split()
+        if len(parts) >= 4:
+            details["load_avg"] = f"{parts[0]} {parts[1]} {parts[2]}"
+            details["running_threads"] = parts[3]
+
+    if oom_kills > 0:
+        details["oom_kills"] = oom_kills
+
+    return StabilityReport(
+        uptime_hours=uptime,
+        bsod_dumps=[],
+        kernel_errors=kernel_errors,
+        page_faults_per_sec=page_faults,
+        pool_failures_nonpaged=None,
+        pool_failures_paged=None,
+        handle_count=handle_count,
+        thread_count=thread_count,
+        process_count=process_count,
+        details=details,
+    )

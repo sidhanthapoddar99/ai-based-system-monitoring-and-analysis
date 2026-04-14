@@ -5,21 +5,20 @@
 Cross-platform system health diagnostic tool that collects hardware and software metrics, detects anomalies, and generates reports. Works on **Windows**, **Linux**, **macOS**, and **WSL**.
 
 Collects:
-- RAM usage, kernel memory pools (nonpaged/paged), swap
-- CPU load, per-core usage, interrupts/sec, interrupt time, DPC time
+- RAM usage, kernel memory pools (nonpaged/paged), page faults, swap
+- CPU load, per-core usage, interrupts/sec, interrupt time, DPC time, context switches/sec, system calls/sec, processor queue length
+- Stability: uptime, BSOD/crash dumps, kernel errors from event logs, pool allocation failures, system-wide handle/thread/process counts
 - Temperatures (ACPI zones, sensors, SMC)
 - Disk usage and I/O throughput
 - Process breakdown by RAM and CPU (individual + grouped by app)
 - Display/GPU info (refresh rates, resolution, multi-GPU detection)
-
-Analyzes data against thresholds to flag anomalies like memory leaks, CPU spin, thermal throttling, disk pressure, and runaway processes.
+- WSL details (per-distro RAM, load average, OOM kills, processes, .wslconfig)
 
 ## 2. How to Run the Code
 
 ### Setup
 
 ```bash
-# From the project root
 python -m venv venv
 
 # Activate
@@ -33,9 +32,10 @@ pip install -r requirements.txt
 
 ### Requirements
 
-- Python 3.14+ (3.10+ should also work)
+- Python 3.10+ (tested on 3.14)
 - `psutil` (installed via requirements.txt)
-- Windows: PowerShell (for interrupts, kernel pools, display info)
+- `jq` (optional, for CLI JSON filtering)
+- Windows: PowerShell (for interrupts, kernel pools, stability, display info)
 - Linux: `/proc` filesystem, optionally `xrandr`
 - macOS: `sysctl`, `system_profiler`, optionally `sudo powermetrics` for temps
 
@@ -48,7 +48,7 @@ python main.py
 ```
 
 This will:
-1. Collect all system metrics
+1. Collect all system metrics including stability and WSL
 2. Save raw data as JSON to `logs/reports/YYYY-MM-DD_HHMMSS_report.json`
 3. Run anomaly detection against thresholds
 4. Save human-readable analysis to `logs/analysis/YYYY-MM-DD_HHMMSS_analysis.md`
@@ -60,11 +60,7 @@ This will:
 python main.py --analyze-only
 ```
 
-Prints the full analysis markdown to the terminal without writing any files. Good for quick checks.
-
 ### Anomaly Thresholds
-
-The analyzer checks for:
 
 | Metric | Warning | Critical |
 |---|---|---|
@@ -74,12 +70,20 @@ The analyzer checks for:
 | Interrupts/sec | > 100,000 | - |
 | % Interrupt time | > 5% | - |
 | % DPC time | > 5% | - |
+| Context switches/sec | > 100,000 | - |
 | Temperature | > 80°C | > 95°C |
 | Disk usage | > 90% | > 95% |
 | Disk queue length | > 2.0 | - |
-| Single process RAM | > 4 GB (info) | - |
-| Process CPU time | > 10,000 sec (warning) | - |
-| Kernel memory gap | > 4 GB unaccounted | - |
+| Process RAM > 4 GB | info | - |
+| Process CPU > 10,000 sec | warning | - |
+| Kernel memory gap > 4 GB | warning | - |
+| BSOD dumps found | - | critical |
+| Kernel/system errors | warning | - |
+| Page faults > 5,000/sec | warning | - |
+| Nonpaged pool failures | - | critical |
+| Handle count > 500,000 | warning | - |
+| Uptime < 1 hour | info | - |
+| WSL OOM kills | warning | - |
 
 ## 4. How to Generate Reports
 
@@ -89,78 +93,69 @@ The analyzer checks for:
 python main.py --report-only
 ```
 
-Saves machine-readable JSON to `logs/reports/` without running analysis. Useful for feeding into other tools or comparing snapshots over time.
-
 ### Full Report + Analysis
 
 ```bash
 python main.py
 ```
 
-Generates both:
-- `logs/reports/YYYY-MM-DD_HHMMSS_report.json` — raw data
-- `logs/analysis/YYYY-MM-DD_HHMMSS_analysis.md` — formatted findings
+### View Past Reports
 
-### Report Structure
+```bash
+python main.py --view latest
+python main.py --view latest --jq '.ram.details'
+python main.py --view latest --jq '.stability.kernel_errors'
+python main.py --view latest --jq '.wsl.distros'
+python main.py --view latest --jq '.processes.by_cpu[0]'
+python main.py --view logs/reports/YYYY-MM-DD_HHMMSS_report.json
+```
 
-The JSON report contains these sections:
-```json
-{
-  "timestamp": "...",
-  "system": { "hostname", "os_name", "cpu_model", ... },
-  "ram": { "total_gb", "used_gb", "details": { "nonpaged_pool_mb", ... } },
-  "cpu": { "load_percent", "interrupts_per_sec", "per_core_percent", ... },
-  "temperatures": { "readings": [...], "source": "..." },
-  "disk": { "partitions": [...], "io": { ... } },
-  "processes": { "by_ram": [...], "by_cpu": [...], "grouped_by_name": [...] },
-  "display": { "displays": [...] }
-}
+Or with `jq` directly:
+```bash
+cat logs/reports/*_report.json | jq '.stability'
 ```
 
 ## 5. Individual Section Queries (No Reports)
 
-Run a single collector and print its output directly to the terminal as JSON:
-
 ```bash
-python main.py --section system      # Machine info
-python main.py --section ram         # RAM + kernel pools
-python main.py --section cpu         # CPU load + interrupts
-python main.py --section temps       # Temperature sensors
-python main.py --section disk        # Disk usage + I/O
-python main.py --section processes   # Process list (top 20)
-python main.py --section display     # GPU/monitor refresh rates
+python main.py --section system       # Machine info + uptime
+python main.py --section ram           # RAM + kernel pools + page faults
+python main.py --section cpu           # CPU + interrupts + context switches
+python main.py --section temps         # Temperature sensors
+python main.py --section disk          # Disk usage + I/O
+python main.py --section processes     # Process list (top 20)
+python main.py --section display       # GPU/monitor refresh rates
+python main.py --section stability     # Crash dumps, kernel errors, handles
+python main.py --section wsl           # WSL distro details (Windows only)
 ```
 
-No files are written. Output is JSON to stdout — pipe it to `jq` or other tools:
-
-```bash
-python main.py --section ram | jq '.details'
-python main.py --section processes | jq '.by_cpu[:5]'
-```
+No files are written. Output is JSON to stdout.
 
 ## Project Structure
 
 ```
 ├── main.py                 # Entry point — CLI, orchestration, output formatting
 ├── CLAUDE.md               # This file
+├── README.md               # Full documentation with examples
 ├── requirements.txt        # Python dependencies (psutil)
-├── process.md              # Manual audit methodology documentation
-├── monitor.ps1             # Original PowerShell live monitor script
+├── .gitignore
 ├── modules/
 │   ├── base.py             # Shared dataclasses + anomaly detection logic
 │   ├── windows/
-│   │   └── collectors.py   # Windows: psutil + PowerShell/WMI
+│   │   └── collectors.py   # Windows: psutil + PowerShell/WMI + WSL bridge
 │   ├── linux/
-│   │   └── collectors.py   # Linux/WSL: psutil + /proc + xrandr
+│   │   └── collectors.py   # Linux/WSL: psutil + /proc + dmesg + journalctl
 │   └── mac/
 │       └── collectors.py   # macOS: psutil + sysctl + system_profiler
 └── logs/
-    ├── reports/            # Raw JSON snapshots
-    └── analysis/           # Markdown analysis reports
+    ├── reports/            # Raw JSON snapshots (.gitignored)
+    └── analysis/           # Markdown analysis reports (.gitignored)
 ```
 
 ## Notes
 
-- Some collectors need **admin/sudo** for full data (Windows temps via WMI, Linux sensors). The tool degrades gracefully — it reports what it can access.
-- Windows interrupt/DPC counters use `Get-Counter` which blocks for ~2 seconds per sample. Total collection time is ~10-15 seconds on Windows.
-- The `logs/reports/` and `logs/analysis/` directories are gitignored (contents only — `.gitkeep` files are tracked).
+- Some collectors need **admin/sudo** for full data (Windows temps, Linux dmesg). The tool degrades gracefully.
+- Windows collection takes ~15-20 seconds due to `Get-Counter` sampling.
+- System processes (System Idle, svchost, csrss, etc.) are auto-excluded from CPU anomaly detection.
+- WSL metrics are collected from the Windows host by running `wsl -d <distro>` commands.
+- `logs/reports/` and `logs/analysis/` contents are gitignored; `.gitkeep` files are tracked.

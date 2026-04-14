@@ -3,12 +3,14 @@ import subprocess
 import socket
 import json
 import re
+import time
+from datetime import datetime
 
 import psutil
 
 from modules.base import (
     SystemInfo, RamReport, CpuReport, TemperatureReport,
-    DiskReport, ProcessReport, DisplayReport,
+    DiskReport, ProcessReport, DisplayReport, StabilityReport,
 )
 
 
@@ -28,6 +30,10 @@ def collect_system_info() -> SystemInfo:
     os_version = _run_cmd(["sw_vers", "-productVersion"]) or uname.release
     os_name = f"macOS {os_version}"
 
+    boot = psutil.boot_time()
+    uptime = time.time() - boot if boot else None
+    boot_str = datetime.fromtimestamp(boot).isoformat() if boot else None
+
     return SystemInfo(
         hostname=socket.gethostname(),
         os_name=os_name,
@@ -36,6 +42,8 @@ def collect_system_info() -> SystemInfo:
         cpu_cores=psutil.cpu_count(logical=False) or 0,
         cpu_threads=psutil.cpu_count(logical=True) or 0,
         total_ram_gb=round(psutil.virtual_memory().total / (1024**3), 1),
+        uptime_seconds=round(uptime, 0) if uptime else None,
+        boot_time=boot_str,
     )
 
 
@@ -222,3 +230,53 @@ def collect_display() -> DisplayReport:
         except (json.JSONDecodeError, KeyError):
             pass
     return DisplayReport(displays=displays)
+
+
+def collect_stability() -> StabilityReport:
+    uptime = None
+    boot = psutil.boot_time()
+    if boot:
+        uptime = round((time.time() - boot) / 3600, 2)
+
+    kernel_errors = []
+    # Check system.log / log show for kernel panics and errors
+    log_output = _run_cmd([
+        "log", "show", "--predicate",
+        "eventMessage contains 'panic' or eventMessage contains 'error'",
+        "--style", "compact", "--last", "48h",
+        "--info",
+    ], timeout=15)
+    if log_output:
+        for line in log_output.splitlines()[-20:]:
+            kernel_errors.append({"message": line.strip()[:200]})
+
+    # Check for panic logs
+    bsod_dumps = []
+    from pathlib import Path
+    panic_dir = Path("/Library/Logs/DiagnosticReports")
+    if panic_dir.exists():
+        for f in sorted(panic_dir.glob("*.panic"), key=lambda x: x.stat().st_mtime, reverse=True)[:10]:
+            bsod_dumps.append({
+                "file": f.name,
+                "date": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
+                "size_kb": round(f.stat().st_size / 1024),
+            })
+
+    process_count = None
+    try:
+        process_count = len(list(psutil.process_iter()))
+    except Exception:
+        pass
+
+    return StabilityReport(
+        uptime_hours=uptime,
+        bsod_dumps=bsod_dumps,
+        kernel_errors=kernel_errors,
+        page_faults_per_sec=None,
+        pool_failures_nonpaged=None,
+        pool_failures_paged=None,
+        handle_count=None,
+        thread_count=None,
+        process_count=process_count,
+        details={},
+    )
