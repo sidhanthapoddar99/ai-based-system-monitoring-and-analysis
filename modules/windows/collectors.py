@@ -304,24 +304,184 @@ def collect_processes(top_n: int = 20) -> ProcessReport:
 
 def collect_display() -> DisplayReport:
     displays = []
-    data = _run_ps_json(
+
+    # --- GPU adapter info (VRAM, driver) keyed by PNPDeviceID substring ---
+    gpu_info = {}
+    gpu_data = _run_ps_json(
         "Get-CimInstance Win32_VideoController | "
-        "Where-Object { $_.CurrentRefreshRate -gt 0 } | "
-        "Select-Object Name, CurrentRefreshRate, "
-        "CurrentHorizontalResolution, CurrentVerticalResolution, "
-        "AdapterRAM, DriverVersion"
+        "Select-Object Name, PNPDeviceID, AdapterRAM, DriverVersion"
     )
-    if data:
-        if isinstance(data, dict):
-            data = [data]
-        for entry in data:
+    if gpu_data:
+        if isinstance(gpu_data, dict):
+            gpu_data = [gpu_data]
+        for g in gpu_data:
+            pnp = g.get("PNPDeviceID", "")
+            gpu_info[pnp.upper()] = {
+                "name": g.get("Name", "unknown"),
+                "vram_gb": round(int(g.get("AdapterRAM") or 0) / (1024**3), 1),
+                "driver_version": g.get("DriverVersion", "unknown"),
+            }
+
+    # --- Per-monitor enumeration via QueryDisplayConfig API ---
+    _QDC_PS = r"""
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+
+public class QDCHelper {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID { public uint LowPart; public int HighPart; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RATIONAL { public uint Num; public uint Den; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PATH_SOURCE { public LUID adapterId; public uint id; public uint modeIdx; public uint flags; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PATH_TARGET {
+        public LUID adapterId; public uint id; public uint modeIdx;
+        public uint outTech; public uint rotation; public uint scaling;
+        public RATIONAL refreshRate;
+        public uint scanLine; public bool available; public uint flags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PATH_INFO { public PATH_SOURCE src; public PATH_TARGET tgt; public uint flags; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct REGION2D { public uint cx; public uint cy; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VIDEO_SIGNAL {
+        public ulong pixelRate; public RATIONAL hSync; public RATIONAL vSync;
+        public REGION2D activeSize; public REGION2D totalSize;
+        public uint videoStd; public uint scanLine;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct TARGET_MODE { public VIDEO_SIGNAL sig; }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct MODE_INFO {
+        [FieldOffset(0)] public uint infoType;
+        [FieldOffset(4)] public uint id;
+        [FieldOffset(8)] public LUID adapterId;
+        [FieldOffset(16)] public TARGET_MODE targetMode;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DEV_HEADER { public uint type; public uint size; public LUID adapterId; public uint id; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct TARGET_NAME {
+        public DEV_HEADER header; public uint flags; public uint outTech;
+        public ushort mfgId; public ushort prodId; public uint connInst;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string monName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string monPath;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct ADAPTER_NAME {
+        public DEV_HEADER header;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string path;
+    }
+
+    [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint f, out uint np, out uint nm);
+    [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint f, ref uint np, [Out] PATH_INFO[] p, ref uint nm, [Out] MODE_INFO[] m, IntPtr t);
+    [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref TARGET_NAME i);
+    [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref ADAPTER_NAME i);
+
+    public static List<string> Get() {
+        var r = new List<string>();
+        uint np, nm;
+        GetDisplayConfigBufferSizes(2, out np, out nm);
+        var paths = new PATH_INFO[np]; var modes = new MODE_INFO[nm];
+        if (QueryDisplayConfig(2, ref np, paths, ref nm, modes, IntPtr.Zero) != 0) return r;
+        for (int i = 0; i < np; i++) {
+            var p = paths[i]; if (p.flags == 0) continue;
+            double hz = p.tgt.refreshRate.Den > 0 ? (double)p.tgt.refreshRate.Num / p.tgt.refreshRate.Den : 0;
+            uint w = 0, h = 0;
+            if (p.tgt.modeIdx < nm) { w = modes[p.tgt.modeIdx].targetMode.sig.activeSize.cx; h = modes[p.tgt.modeIdx].targetMode.sig.activeSize.cy; }
+            var tn = new TARGET_NAME(); tn.header.type = 2; tn.header.size = (uint)Marshal.SizeOf(typeof(TARGET_NAME));
+            tn.header.adapterId = p.tgt.adapterId; tn.header.id = p.tgt.id;
+            DisplayConfigGetDeviceInfo(ref tn);
+            var an = new ADAPTER_NAME(); an.header.type = 4; an.header.size = (uint)Marshal.SizeOf(typeof(ADAPTER_NAME));
+            an.header.adapterId = p.tgt.adapterId; an.header.id = p.tgt.id;
+            DisplayConfigGetDeviceInfo(ref an);
+            r.Add(tn.monName + "|" + (an.path ?? "") + "|" + w + "|" + h + "|" + hz.ToString("F2"));
+        }
+        return r;
+    }
+}
+'@
+[QDCHelper]::Get() | ForEach-Object { Write-Output $_ }
+"""
+    raw = _run_ps(_QDC_PS, timeout=20)
+    if raw:
+        for line in raw.strip().splitlines():
+            parts = line.split("|", 4)
+            if len(parts) < 5:
+                continue
+            mon_name, adapter_path, w, h, hz = parts
+            adapter_upper = adapter_path.upper()
+
+            # Match adapter path to GPU info by PNPDeviceID substring
+            gpu_name = "unknown"
+            vram = 0.0
+            driver = "unknown"
+            for pnp, info in gpu_info.items():
+                # adapter_path contains the PCI VEN&DEV substring
+                pnp_key = pnp.replace("\\", "#")
+                if pnp_key in adapter_upper or pnp.split("\\")[-1] in adapter_upper:
+                    gpu_name = info["name"]
+                    vram = info["vram_gb"]
+                    driver = info["driver_version"]
+                    break
+            else:
+                # Fallback: match by VEN_ substring
+                for pnp, info in gpu_info.items():
+                    ven_dev = [p for p in pnp.split("\\") if p.startswith("VEN_")]
+                    if ven_dev and ven_dev[0] in adapter_upper:
+                        gpu_name = info["name"]
+                        vram = info["vram_gb"]
+                        driver = info["driver_version"]
+                        break
+
+            try:
+                refresh = round(float(hz), 2)
+            except ValueError:
+                refresh = 0
             displays.append({
-                "gpu": entry.get("Name", "unknown"),
-                "refresh_rate": entry.get("CurrentRefreshRate"),
-                "resolution": f"{entry.get('CurrentHorizontalResolution', '?')}x{entry.get('CurrentVerticalResolution', '?')}",
-                "vram_gb": round(int(entry.get("AdapterRAM", 0)) / (1024**3), 1),
-                "driver_version": entry.get("DriverVersion", "unknown"),
+                "monitor": mon_name.strip() or "unknown",
+                "gpu": gpu_name,
+                "refresh_rate": refresh,
+                "resolution": f"{w}x{h}",
+                "vram_gb": vram,
+                "driver_version": driver,
             })
+
+    # Fallback to Win32_VideoController if QueryDisplayConfig returned nothing
+    if not displays:
+        data = _run_ps_json(
+            "Get-CimInstance Win32_VideoController | "
+            "Where-Object { $_.CurrentRefreshRate -gt 0 } | "
+            "Select-Object Name, CurrentRefreshRate, "
+            "CurrentHorizontalResolution, CurrentVerticalResolution, "
+            "AdapterRAM, DriverVersion"
+        )
+        if data:
+            if isinstance(data, dict):
+                data = [data]
+            for entry in data:
+                displays.append({
+                    "gpu": entry.get("Name", "unknown"),
+                    "refresh_rate": entry.get("CurrentRefreshRate"),
+                    "resolution": f"{entry.get('CurrentHorizontalResolution', '?')}x{entry.get('CurrentVerticalResolution', '?')}",
+                    "vram_gb": round(int(entry.get("AdapterRAM", 0)) / (1024**3), 1),
+                    "driver_version": entry.get("DriverVersion", "unknown"),
+                })
     return DisplayReport(displays=displays)
 
 
