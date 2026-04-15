@@ -12,6 +12,9 @@ Collects:
 - Disk usage and I/O throughput
 - Process breakdown by RAM and CPU (individual + grouped by app)
 - Display/GPU info (refresh rates, resolution, multi-GPU detection)
+- GPU metrics (temperature, utilization, VRAM, power draw, clocks via nvidia-smi)
+- Network (active adapters, link speed, ping latency, packet loss, DNS resolution time)
+- Storage health (SMART/physical disk status, problem devices)
 - WSL details (per-distro RAM, load average, OOM kills, processes, .wslconfig)
 
 ## 2. How to Run the Code
@@ -44,7 +47,7 @@ pip install -r requirements.txt
 ### Full Run (Report + Analysis)
 
 ```bash
-python main.py
+./venv/Scripts/python.exe main.py
 ```
 
 This will:
@@ -57,7 +60,7 @@ This will:
 ### Terminal-Only Analysis (No Files)
 
 ```bash
-python main.py --analyze-only
+./venv/Scripts/python.exe main.py --analyze-only
 ```
 
 ### Anomaly Thresholds
@@ -84,30 +87,38 @@ python main.py --analyze-only
 | Handle count > 500,000 | warning | - |
 | Uptime < 1 hour | info | - |
 | WSL OOM kills | warning | - |
+| GPU temp > 85°C | warning | > 95°C |
+| GPU utilization > 95% | warning | - |
+| GPU VRAM > 90% | warning | - |
+| Network ping > 100ms | warning | - |
+| Packet loss > 0% | warning | - |
+| DNS resolution > 200ms | warning | - |
+| Disk health != Healthy | - | critical |
+| Problem devices (error code) | warning | - |
 
 ## 4. How to Generate Reports
 
 ### Raw JSON Report Only
 
 ```bash
-python main.py --report-only
+./venv/Scripts/python.exe main.py --report-only
 ```
 
 ### Full Report + Analysis
 
 ```bash
-python main.py
+./venv/Scripts/python.exe main.py
 ```
 
 ### View Past Reports
 
 ```bash
-python main.py --view latest
-python main.py --view latest --jq '.ram.details'
-python main.py --view latest --jq '.stability.kernel_errors'
-python main.py --view latest --jq '.wsl.distros'
-python main.py --view latest --jq '.processes.by_cpu[0]'
-python main.py --view logs/reports/YYYY-MM-DD_HHMMSS_report.json
+./venv/Scripts/python.exe main.py --view latest
+./venv/Scripts/python.exe main.py --view latest --jq '.ram.details'
+./venv/Scripts/python.exe main.py --view latest --jq '.stability.kernel_errors'
+./venv/Scripts/python.exe main.py --view latest --jq '.wsl.distros'
+./venv/Scripts/python.exe main.py --view latest --jq '.processes.by_cpu[0]'
+./venv/Scripts/python.exe main.py --view logs/reports/YYYY-MM-DD_HHMMSS_report.json
 ```
 
 Or with `jq` directly:
@@ -118,15 +129,18 @@ cat logs/reports/*_report.json | jq '.stability'
 ## 5. Individual Section Queries (No Reports)
 
 ```bash
-python main.py --section system       # Machine info + uptime
-python main.py --section ram           # RAM + kernel pools + page faults
-python main.py --section cpu           # CPU + interrupts + context switches
-python main.py --section temps         # Temperature sensors
-python main.py --section disk          # Disk usage + I/O
-python main.py --section processes     # Process list (top 20)
-python main.py --section display       # GPU/monitor refresh rates
-python main.py --section stability     # Crash dumps, kernel errors, handles
-python main.py --section wsl           # WSL distro details (Windows only)
+./venv/Scripts/python.exe main.py --section system       # Machine info + uptime
+./venv/Scripts/python.exe main.py --section ram           # RAM + kernel pools + page faults
+./venv/Scripts/python.exe main.py --section cpu           # CPU + interrupts + context switches
+./venv/Scripts/python.exe main.py --section temps         # Temperature sensors
+./venv/Scripts/python.exe main.py --section disk          # Disk usage + I/O
+./venv/Scripts/python.exe main.py --section processes     # Process list (top 20)
+./venv/Scripts/python.exe main.py --section display       # Per-monitor refresh rates + GPU mapping
+./venv/Scripts/python.exe main.py --section gpu            # GPU temp, utilization, VRAM, power
+./venv/Scripts/python.exe main.py --section network        # Adapters, ping, DNS latency
+./venv/Scripts/python.exe main.py --section storage        # Disk health, problem devices
+./venv/Scripts/python.exe main.py --section stability     # Crash dumps, kernel errors, handles
+./venv/Scripts/python.exe main.py --section wsl           # WSL distro details (Windows only)
 ```
 
 No files are written. Output is JSON to stdout.

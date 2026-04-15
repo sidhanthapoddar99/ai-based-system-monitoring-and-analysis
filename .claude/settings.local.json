@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(./venv/Scripts/python.exe main.py --section display)",
-      "Bash(./venv/Scripts/python.exe main.py --analyze-only)"
+      "Bash(./venv/Scripts/python.exe main.py --analyze-only)",
+      "Bash(./venv/Scripts/python.exe main.py)",
+      "Bash(powershell *)"
     ]
   }
 }

@@ -11,6 +11,7 @@ import psutil
 from modules.base import (
     SystemInfo, RamReport, CpuReport, TemperatureReport,
     DiskReport, ProcessReport, DisplayReport, StabilityReport, WslReport,
+    GpuReport, NetworkReport, StorageHealthReport,
 )
 
 
@@ -715,3 +716,176 @@ def collect_wsl() -> WslReport:
     details["vmmem_processes"] = vmmem_procs
 
     return WslReport(distros=distros, details=details)
+
+
+def collect_gpu() -> GpuReport:
+    gpus = []
+
+    # Try nvidia-smi first
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,temperature.gpu,utilization.gpu,"
+             "utilization.memory,memory.used,memory.total,fan.speed,"
+             "power.draw,power.limit,clocks.current.graphics,clocks.current.memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 11:
+                    gpus.append({
+                        "name": parts[0],
+                        "temperature_c": _safe_int(parts[1]),
+                        "utilization_percent": _safe_int(parts[2]),
+                        "memory_utilization_percent": _safe_int(parts[3]),
+                        "vram_used_mb": _safe_int(parts[4]),
+                        "vram_total_mb": _safe_int(parts[5]),
+                        "fan_speed_percent": _safe_int(parts[6]),
+                        "power_draw_w": _safe_float(parts[7]),
+                        "power_limit_w": _safe_float(parts[8]),
+                        "clock_graphics_mhz": _safe_int(parts[9]),
+                        "clock_memory_mhz": _safe_int(parts[10]),
+                    })
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+    # Also detect Intel/AMD iGPU via WMI (no utilization data, but presence)
+    igpu_data = _run_ps_json(
+        "Get-CimInstance Win32_VideoController | "
+        "Where-Object { $_.Name -notmatch 'NVIDIA' -and $_.Name -notmatch 'Virtual' "
+        "-and $_.Name -notmatch 'Parsec' -and $_.Name -notmatch 'Meta' "
+        "-and $_.CurrentRefreshRate -gt 0 } | "
+        "Select-Object Name, AdapterRAM, DriverVersion, Status"
+    )
+    if igpu_data:
+        if isinstance(igpu_data, dict):
+            igpu_data = [igpu_data]
+        for g in igpu_data:
+            gpus.append({
+                "name": g.get("Name", "unknown"),
+                "vram_total_mb": round(int(g.get("AdapterRAM") or 0) / (1024**2)),
+                "driver_version": g.get("DriverVersion", "unknown"),
+                "status": g.get("Status", "unknown"),
+            })
+
+    return GpuReport(gpus=gpus)
+
+
+def _safe_int(val):
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_float(val):
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def collect_network() -> NetworkReport:
+    adapters = []
+
+    # Active network adapters
+    adapter_data = _run_ps_json(
+        "Get-NetAdapter | Where-Object Status -eq 'Up' | "
+        "Select-Object Name, InterfaceDescription, LinkSpeed, MacAddress, "
+        "MediaType, DriverVersion"
+    )
+    if adapter_data:
+        if isinstance(adapter_data, dict):
+            adapter_data = [adapter_data]
+        for a in adapter_data:
+            adapters.append({
+                "name": a.get("Name", "unknown"),
+                "description": a.get("InterfaceDescription", ""),
+                "link_speed": a.get("LinkSpeed", "unknown"),
+                "mac_address": a.get("MacAddress", ""),
+                "driver_version": a.get("DriverVersion", ""),
+            })
+
+    # Latency test
+    latency = {}
+    ping_raw = _run_ps(
+        "Test-Connection 8.8.8.8 -Count 3 -ErrorAction SilentlyContinue | "
+        "Select-Object Status, Latency | ConvertTo-Json -Compress",
+        timeout=20,
+    )
+    if ping_raw:
+        try:
+            ping_data = json.loads(ping_raw)
+            if isinstance(ping_data, dict):
+                ping_data = [ping_data]
+            latencies = [p.get("Latency", 0) for p in ping_data
+                         if p.get("Status") == "Success" or p.get("Latency", 0) > 0]
+            if latencies:
+                latency["ping_avg_ms"] = round(sum(latencies) / len(latencies), 1)
+                latency["ping_min_ms"] = min(latencies)
+                latency["ping_max_ms"] = max(latencies)
+            total = len(ping_data)
+            success = len(latencies)
+            latency["packet_loss_percent"] = round((total - success) / total * 100, 1) if total else 0
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # DNS latency
+    dns_raw = _run_ps(
+        "$sw = [System.Diagnostics.Stopwatch]::StartNew(); "
+        "Resolve-DnsName google.com -ErrorAction SilentlyContinue | Out-Null; "
+        "$sw.Stop(); $sw.ElapsedMilliseconds",
+        timeout=10,
+    )
+    if dns_raw:
+        try:
+            latency["dns_ms"] = int(dns_raw.strip())
+        except ValueError:
+            pass
+
+    return NetworkReport(adapters=adapters, latency=latency or None)
+
+
+def collect_storage_health() -> StorageHealthReport:
+    disks = []
+    problem_devices = []
+
+    # Physical disk health
+    disk_data = _run_ps_json(
+        "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, "
+        "HealthStatus, OperationalStatus, "
+        "@{N='SizeGB';E={[math]::Round($_.Size / 1GB, 1)}}, "
+        "BusType, FirmwareVersion"
+    )
+    if disk_data:
+        if isinstance(disk_data, dict):
+            disk_data = [disk_data]
+        for d in disk_data:
+            disks.append({
+                "name": d.get("FriendlyName", "unknown"),
+                "media_type": d.get("MediaType", "unknown"),
+                "health_status": d.get("HealthStatus", "unknown"),
+                "operational_status": d.get("OperationalStatus", "unknown"),
+                "size_gb": d.get("SizeGB", 0),
+                "bus_type": d.get("BusType", "unknown"),
+                "firmware_version": d.get("FirmwareVersion", ""),
+            })
+
+    # Problem devices (error code != 0)
+    dev_data = _run_ps_json(
+        "Get-CimInstance Win32_PnPEntity | "
+        "Where-Object { $_.ConfigManagerErrorCode -ne 0 } | "
+        "Select-Object Name, DeviceID, ConfigManagerErrorCode"
+    )
+    if dev_data:
+        if isinstance(dev_data, dict):
+            dev_data = [dev_data]
+        for d in dev_data:
+            problem_devices.append({
+                "name": d.get("Name", "unknown"),
+                "device_id": d.get("DeviceID", ""),
+                "error_code": d.get("ConfigManagerErrorCode", 0),
+            })
+
+    return StorageHealthReport(disks=disks, problem_devices=problem_devices)

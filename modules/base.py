@@ -58,6 +58,23 @@ class ProcessReport:
 
 
 @dataclass
+class GpuReport:
+    gpus: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class NetworkReport:
+    adapters: list[dict] = field(default_factory=list)
+    latency: Optional[dict] = None
+
+
+@dataclass
+class StorageHealthReport:
+    disks: list[dict] = field(default_factory=list)
+    problem_devices: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class DisplayReport:
     displays: list[dict] = field(default_factory=list)
 
@@ -98,7 +115,10 @@ def analyze(system: SystemInfo, ram: RamReport, cpu: CpuReport,
             processes: ProcessReport,
             display: Optional[DisplayReport] = None,
             stability: Optional[StabilityReport] = None,
-            wsl: Optional[WslReport] = None) -> list[Anomaly]:
+            wsl: Optional[WslReport] = None,
+            gpu: Optional[GpuReport] = None,
+            network: Optional[NetworkReport] = None,
+            storage_health: Optional[StorageHealthReport] = None) -> list[Anomaly]:
     anomalies = []
 
     # --- RAM ---
@@ -303,5 +323,67 @@ def analyze(system: SystemInfo, ram: RamReport, cpu: CpuReport,
                                          f"WSL distro '{distro.get('name', '?')}' has "
                                          f"{oom_kills} OOM kill(s).",
                                          oom_kills, 0))
+
+    # --- GPU ---
+    if gpu:
+        for g in gpu.gpus:
+            temp = g.get("temperature_c")
+            name = g.get("name", "GPU")
+            if temp and temp > 95:
+                anomalies.append(Anomaly("gpu", "critical",
+                                         f"{name} at {temp}°C — thermal throttling likely.",
+                                         temp, 95))
+            elif temp and temp > 85:
+                anomalies.append(Anomaly("gpu", "warning",
+                                         f"{name} at {temp}°C — running hot.",
+                                         temp, 85))
+            util = g.get("utilization_percent")
+            if util and util > 95:
+                anomalies.append(Anomaly("gpu", "warning",
+                                         f"{name} GPU utilization at {util}%. Fully saturated.",
+                                         util, 95))
+            vram_used = g.get("vram_used_mb", 0)
+            vram_total = g.get("vram_total_mb", 0)
+            if vram_total and vram_used / vram_total > 0.90:
+                pct = vram_used / vram_total * 100
+                anomalies.append(Anomaly("gpu", "warning",
+                                         f"{name} VRAM usage: {vram_used} MB / {vram_total} MB ({pct:.0f}%).",
+                                         pct, 90))
+
+    # --- Network ---
+    if network:
+        if network.latency:
+            ping_ms = network.latency.get("ping_avg_ms")
+            if ping_ms and ping_ms > 100:
+                anomalies.append(Anomaly("network", "warning",
+                                         f"Network latency: {ping_ms:.0f}ms avg (normal: < 50ms).",
+                                         ping_ms, 100))
+            packet_loss = network.latency.get("packet_loss_percent")
+            if packet_loss and packet_loss > 0:
+                anomalies.append(Anomaly("network", "warning",
+                                         f"Packet loss: {packet_loss:.1f}%.",
+                                         packet_loss, 0))
+            dns_ms = network.latency.get("dns_ms")
+            if dns_ms and dns_ms > 200:
+                anomalies.append(Anomaly("network", "warning",
+                                         f"DNS resolution: {dns_ms:.0f}ms (normal: < 100ms). "
+                                         "Consider switching DNS to 1.1.1.1 or 8.8.8.8.",
+                                         dns_ms, 200))
+
+    # --- Storage Health ---
+    if storage_health:
+        for d in storage_health.disks:
+            health = d.get("health_status", "").lower()
+            name = d.get("name", "Disk")
+            if health and health != "healthy":
+                anomalies.append(Anomaly("storage", "critical",
+                                         f"{name} health status: {d['health_status']}. "
+                                         "Backup data immediately.",
+                                         0, 0))
+        for dev in storage_health.problem_devices:
+            anomalies.append(Anomaly("storage", "warning",
+                                     f"Problem device: {dev.get('name', 'unknown')} "
+                                     f"(error code {dev.get('error_code', '?')}).",
+                                     0, 0))
 
     return anomalies

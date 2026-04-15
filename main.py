@@ -67,6 +67,18 @@ def collect_all(collectors):
     display = collectors.collect_display()
     print("done")
 
+    print("Collecting GPU metrics...", end=" ", flush=True)
+    gpu = collectors.collect_gpu() if hasattr(collectors, "collect_gpu") else None
+    print("done")
+
+    print("Collecting network info...", end=" ", flush=True)
+    network = collectors.collect_network() if hasattr(collectors, "collect_network") else None
+    print("done")
+
+    print("Collecting storage health...", end=" ", flush=True)
+    storage_health = collectors.collect_storage_health() if hasattr(collectors, "collect_storage_health") else None
+    print("done")
+
     print("Collecting stability metrics...", end=" ", flush=True)
     stability = collectors.collect_stability()
     print("done")
@@ -77,10 +89,11 @@ def collect_all(collectors):
         wsl = collectors.collect_wsl()
         print("done")
 
-    return system, ram, cpu, temps, disk, processes, display, stability, wsl
+    return system, ram, cpu, temps, disk, processes, display, stability, wsl, gpu, network, storage_health
 
 
-def format_report_json(timestamp, system, ram, cpu, temps, disk, processes, display, stability, wsl):
+def format_report_json(timestamp, system, ram, cpu, temps, disk, processes,
+                       display, stability, wsl, gpu, network, storage_health):
     report = {
         "timestamp": timestamp,
         "system": asdict(system),
@@ -94,11 +107,18 @@ def format_report_json(timestamp, system, ram, cpu, temps, disk, processes, disp
     }
     if wsl:
         report["wsl"] = asdict(wsl)
+    if gpu:
+        report["gpu"] = asdict(gpu)
+    if network:
+        report["network"] = asdict(network)
+    if storage_health:
+        report["storage_health"] = asdict(storage_health)
     return report
 
 
 def format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
-                       processes, display, stability, wsl):
+                       processes, display, stability, wsl, gpu, network,
+                       storage_health):
     lines = [
         f"# System Analysis — {timestamp}",
         "",
@@ -305,6 +325,69 @@ def format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
             lines.append(f"| {d.get('gpu', '?')} | {res} | {rate} | {', '.join(extra) or '-'} |")
         lines.append("")
 
+    # GPU
+    if gpu and gpu.gpus:
+        lines.append("## GPU")
+        lines.append("")
+        lines.append("| GPU | Temp | Util | VRAM Used | VRAM Total | Fan | Power | Clocks |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for g in gpu.gpus:
+            temp = f"{g['temperature_c']}°C" if g.get("temperature_c") is not None else "-"
+            util = f"{g['utilization_percent']}%" if g.get("utilization_percent") is not None else "-"
+            vused = f"{g['vram_used_mb']} MB" if g.get("vram_used_mb") is not None else "-"
+            vtotal = f"{g['vram_total_mb']} MB" if g.get("vram_total_mb") is not None else "-"
+            fan = f"{g['fan_speed_percent']}%" if g.get("fan_speed_percent") is not None else "-"
+            power = f"{g['power_draw_w']:.0f}W / {g['power_limit_w']:.0f}W" if g.get("power_draw_w") is not None else "-"
+            clocks = f"{g['clock_graphics_mhz']}MHz" if g.get("clock_graphics_mhz") is not None else "-"
+            lines.append(f"| {g.get('name', '?')} | {temp} | {util} | {vused} | {vtotal} | {fan} | {power} | {clocks} |")
+        lines.append("")
+
+    # Network
+    if network:
+        if network.adapters:
+            lines.append("## Network")
+            lines.append("")
+            lines.append("| Adapter | Description | Link Speed | Driver |")
+            lines.append("|---|---|---|---|")
+            for a in network.adapters:
+                lines.append(f"| {a.get('name', '?')} | {a.get('description', '')} | "
+                             f"{a.get('link_speed', '?')} | {a.get('driver_version', '-')} |")
+            lines.append("")
+        if network.latency:
+            lines.append("### Latency")
+            lines.append("")
+            lines.append("| Metric | Value |")
+            lines.append("|---|---|")
+            lat = network.latency
+            if lat.get("ping_avg_ms") is not None:
+                lines.append(f"| Ping (8.8.8.8) | {lat['ping_min_ms']}-{lat['ping_max_ms']}ms (avg {lat['ping_avg_ms']}ms) |")
+            if lat.get("packet_loss_percent") is not None:
+                lines.append(f"| Packet Loss | {lat['packet_loss_percent']}% |")
+            if lat.get("dns_ms") is not None:
+                lines.append(f"| DNS Resolution | {lat['dns_ms']}ms |")
+            lines.append("")
+
+    # Storage Health
+    if storage_health:
+        if storage_health.disks:
+            lines.append("## Storage Health")
+            lines.append("")
+            lines.append("| Drive | Type | Health | Status | Size | Bus |")
+            lines.append("|---|---|---|---|---|---|")
+            for d in storage_health.disks:
+                lines.append(f"| {d.get('name', '?')} | {d.get('media_type', '?')} | "
+                             f"{d.get('health_status', '?')} | {d.get('operational_status', '?')} | "
+                             f"{d.get('size_gb', '?')} GB | {d.get('bus_type', '?')} |")
+            lines.append("")
+        if storage_health.problem_devices:
+            lines.append("### Problem Devices")
+            lines.append("")
+            lines.append("| Device | Error Code |")
+            lines.append("|---|---|")
+            for d in storage_health.problem_devices:
+                lines.append(f"| {d.get('name', '?')} | {d.get('error_code', '?')} |")
+            lines.append("")
+
     # Temperatures
     if temps.readings:
         lines.append("## Temperatures")
@@ -387,6 +470,12 @@ def print_section(collectors, section: str):
         "display": collectors.collect_display,
         "stability": collectors.collect_stability,
     }
+    if hasattr(collectors, "collect_gpu"):
+        collect_fn["gpu"] = collectors.collect_gpu
+    if hasattr(collectors, "collect_network"):
+        collect_fn["network"] = collectors.collect_network
+    if hasattr(collectors, "collect_storage_health"):
+        collect_fn["storage"] = collectors.collect_storage_health
 
     if section == "wsl":
         if not hasattr(collectors, "collect_wsl"):
@@ -478,12 +567,13 @@ def main():
         return
 
     # Full collection
-    system, ram, cpu, temps, disk, processes, display, stability, wsl = collect_all(collectors)
+    system, ram, cpu, temps, disk, processes, display, stability, wsl, gpu, network, storage_health = collect_all(collectors)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     base_dir = Path(__file__).parent
 
     # Run analysis
-    anomalies = analyze(system, ram, cpu, temps, disk, processes, display, stability, wsl)
+    anomalies = analyze(system, ram, cpu, temps, disk, processes, display, stability, wsl,
+                        gpu, network, storage_health)
 
     # Print summary
     print(f"\n{'='*60}")
@@ -510,7 +600,8 @@ def main():
 
     if args.analyze_only:
         md = format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
-                                processes, display, stability, wsl)
+                                processes, display, stability, wsl, gpu, network,
+                                storage_health)
         print(md)
         return
 
@@ -518,7 +609,8 @@ def main():
     report_dir = base_dir / "logs" / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
     report_data = format_report_json(timestamp, system, ram, cpu, temps, disk,
-                                     processes, display, stability, wsl)
+                                     processes, display, stability, wsl, gpu,
+                                     network, storage_health)
     report_path = report_dir / f"{timestamp}_report.json"
     report_path.write_text(json.dumps(report_data, indent=2, default=str))
     print(f"Report saved: {report_path}")
@@ -530,7 +622,8 @@ def main():
     analysis_dir = base_dir / "logs" / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
     analysis_md = format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
-                                     processes, display, stability, wsl)
+                                     processes, display, stability, wsl, gpu, network,
+                                     storage_health)
     analysis_path = analysis_dir / f"{timestamp}_analysis.md"
     analysis_path.write_text(analysis_md, encoding="utf-8")
     print(f"Analysis saved: {analysis_path}")
