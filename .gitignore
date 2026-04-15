@@ -6,5 +6,7 @@ __pycache__/
 # Log outputs — keep folders via .gitkeep, ignore contents
 logs/reports/*
 logs/analysis/*
+logs/notes/*
 !logs/reports/.gitkeep
 !logs/analysis/.gitkeep
+!logs/notes/.gitkeep
