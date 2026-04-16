@@ -83,17 +83,24 @@ def collect_all(collectors):
     stability = collectors.collect_stability()
     print("done")
 
+    power = None
+    if hasattr(collectors, "collect_power"):
+        print("Collecting power/sleep info...", end=" ", flush=True)
+        power = collectors.collect_power()
+        print("done")
+
     wsl = None
     if platform.system() == "Windows" and hasattr(collectors, "collect_wsl"):
         print("Collecting WSL details...", end=" ", flush=True)
         wsl = collectors.collect_wsl()
         print("done")
 
-    return system, ram, cpu, temps, disk, processes, display, stability, wsl, gpu, network, storage_health
+    return system, ram, cpu, temps, disk, processes, display, stability, wsl, gpu, network, storage_health, power
 
 
 def format_report_json(timestamp, system, ram, cpu, temps, disk, processes,
-                       display, stability, wsl, gpu, network, storage_health):
+                       display, stability, wsl, gpu, network, storage_health,
+                       power=None):
     report = {
         "timestamp": timestamp,
         "system": asdict(system),
@@ -113,12 +120,14 @@ def format_report_json(timestamp, system, ram, cpu, temps, disk, processes,
         report["network"] = asdict(network)
     if storage_health:
         report["storage_health"] = asdict(storage_health)
+    if power:
+        report["power"] = asdict(power)
     return report
 
 
 def format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
                        processes, display, stability, wsl, gpu, network,
-                       storage_health):
+                       storage_health, power=None):
     lines = [
         f"# System Analysis — {timestamp}",
         "",
@@ -230,6 +239,67 @@ def format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
         if stability.details.get("auto_reboot_on_crash") is not None:
             lines.append(f"**Auto-reboot on crash:** {stability.details['auto_reboot_on_crash']}")
     lines.append("")
+
+    # Power / Sleep
+    if power:
+        lines.append("## Power & Sleep")
+        lines.append("")
+
+        if power.sleep_blockers:
+            lines.append("### Active Sleep Blockers")
+            lines.append("")
+            lines.append("| PID | Process | Type | Duration | Name |")
+            lines.append("|---|---|---|---|---|")
+            for b in power.sleep_blockers:
+                lines.append(
+                    f"| {b.get('pid', '?')} | {b.get('process', '?')} | "
+                    f"{b.get('assertion_type', '?')} | {b.get('duration', '?')} | "
+                    f"{b.get('name', '?')} |"
+                )
+            lines.append("")
+
+        if power.kernel_assertions:
+            lines.append("### Kernel Wake Assertions")
+            lines.append("")
+            lines.append("| Type | Description | Owner |")
+            lines.append("|---|---|---|")
+            for k in power.kernel_assertions:
+                lines.append(
+                    f"| {k.get('type', '?')} | {k.get('description', '?')} | "
+                    f"{k.get('owner', '?')} |"
+                )
+            lines.append("")
+
+        if power.sleep_wake_stats:
+            lines.append("### Sleep/Wake Stats")
+            lines.append("")
+            lines.append("| Metric | Value |")
+            lines.append("|---|---|")
+            for key, val in power.sleep_wake_stats.items():
+                label = key.replace("_", " ").title()
+                lines.append(f"| {label} | {val} |")
+            lines.append("")
+
+        if power.power_settings:
+            lines.append("### Power Settings")
+            lines.append("")
+            lines.append("| Setting | Value |")
+            lines.append("|---|---|")
+            for key, val in power.power_settings.items():
+                lines.append(f"| {key} | {val} |")
+            lines.append("")
+
+        if power.recent_wake_events:
+            lines.append("### Recent Sleep/Wake Events")
+            lines.append("")
+            lines.append("| Time | Event | Details |")
+            lines.append("|---|---|---|")
+            for e in power.recent_wake_events:
+                lines.append(
+                    f"| {e.get('time', '?')} | {e.get('event', '?')} | "
+                    f"{e.get('details', '')} |"
+                )
+            lines.append("")
 
     # RAM details
     if ram.details:
@@ -476,6 +546,8 @@ def print_section(collectors, section: str):
         collect_fn["network"] = collectors.collect_network
     if hasattr(collectors, "collect_storage_health"):
         collect_fn["storage"] = collectors.collect_storage_health
+    if hasattr(collectors, "collect_power"):
+        collect_fn["power"] = collectors.collect_power
 
     if section == "wsl":
         if not hasattr(collectors, "collect_wsl"):
@@ -545,7 +617,7 @@ def main():
     parser.add_argument("--analyze-only", action="store_true",
                         help="Print analysis to terminal, don't save files")
     parser.add_argument("--section", type=str,
-                        help="Print a single section (ram, cpu, disk, temps, processes, display, stability, wsl)")
+                        help="Print a single section (ram, cpu, disk, temps, processes, display, stability, power, wsl)")
     parser.add_argument("--view", type=str,
                         help="View a report JSON ('latest' or path)")
     parser.add_argument("--jq", type=str,
@@ -567,13 +639,13 @@ def main():
         return
 
     # Full collection
-    system, ram, cpu, temps, disk, processes, display, stability, wsl, gpu, network, storage_health = collect_all(collectors)
+    system, ram, cpu, temps, disk, processes, display, stability, wsl, gpu, network, storage_health, power = collect_all(collectors)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     base_dir = Path(__file__).parent
 
     # Run analysis
     anomalies = analyze(system, ram, cpu, temps, disk, processes, display, stability, wsl,
-                        gpu, network, storage_health)
+                        gpu, network, storage_health, power)
 
     # Print summary
     print(f"\n{'='*60}")
@@ -589,6 +661,9 @@ def main():
         print(f"  Uptime: {stability.uptime_hours:.1f} hours")
     if stability.bsod_dumps:
         print(f"  BSOD Dumps: {len(stability.bsod_dumps)} found!")
+    if power and power.details.get("sleep_blocked_by"):
+        blockers = ", ".join(power.details["sleep_blocked_by"])
+        print(f"  Sleep blocked by: {blockers}")
     if anomalies:
         crit = sum(1 for a in anomalies if a.severity == "critical")
         warn = sum(1 for a in anomalies if a.severity == "warning")
@@ -601,7 +676,7 @@ def main():
     if args.analyze_only:
         md = format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
                                 processes, display, stability, wsl, gpu, network,
-                                storage_health)
+                                storage_health, power)
         print(md)
         return
 
@@ -610,7 +685,7 @@ def main():
     report_dir.mkdir(parents=True, exist_ok=True)
     report_data = format_report_json(timestamp, system, ram, cpu, temps, disk,
                                      processes, display, stability, wsl, gpu,
-                                     network, storage_health)
+                                     network, storage_health, power)
     report_path = report_dir / f"{timestamp}_report.json"
     report_path.write_text(json.dumps(report_data, indent=2, default=str))
     print(f"Report saved: {report_path}")
@@ -623,7 +698,7 @@ def main():
     analysis_dir.mkdir(parents=True, exist_ok=True)
     analysis_md = format_analysis_md(timestamp, system, anomalies, ram, cpu, temps, disk,
                                      processes, display, stability, wsl, gpu, network,
-                                     storage_health)
+                                     storage_health, power)
     analysis_path = analysis_dir / f"{timestamp}_analysis.md"
     analysis_path.write_text(analysis_md, encoding="utf-8")
     print(f"Analysis saved: {analysis_path}")

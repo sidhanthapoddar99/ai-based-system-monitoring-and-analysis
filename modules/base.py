@@ -95,6 +95,17 @@ class StabilityReport:
 
 
 @dataclass
+class PowerReport:
+    """Power assertions, sleep blockers, and sleep/wake history."""
+    sleep_blockers: list[dict] = field(default_factory=list)
+    kernel_assertions: list[dict] = field(default_factory=list)
+    sleep_wake_stats: dict = field(default_factory=dict)
+    power_settings: dict = field(default_factory=dict)
+    recent_wake_events: list[dict] = field(default_factory=list)
+    details: dict = field(default_factory=dict)
+
+
+@dataclass
 class WslReport:
     """WSL distro details collected from the Windows host side."""
     distros: list[dict] = field(default_factory=list)
@@ -118,7 +129,8 @@ def analyze(system: SystemInfo, ram: RamReport, cpu: CpuReport,
             wsl: Optional[WslReport] = None,
             gpu: Optional[GpuReport] = None,
             network: Optional[NetworkReport] = None,
-            storage_health: Optional[StorageHealthReport] = None) -> list[Anomaly]:
+            storage_health: Optional[StorageHealthReport] = None,
+            power: Optional[PowerReport] = None) -> list[Anomaly]:
     anomalies = []
 
     # --- RAM ---
@@ -385,5 +397,49 @@ def analyze(system: SystemInfo, ram: RamReport, cpu: CpuReport,
                                      f"Problem device: {dev.get('name', 'unknown')} "
                                      f"(error code {dev.get('error_code', '?')}).",
                                      0, 0))
+
+    # --- Power / Sleep ---
+    if power:
+        # Check for active sleep blockers
+        user_blockers = [b for b in power.sleep_blockers
+                         if b.get("assertion_type") == "PreventUserIdleSystemSleep"
+                         and b.get("process") != "powerd"]
+        if user_blockers:
+            names = ", ".join(b.get("process", "?") for b in user_blockers)
+            anomalies.append(Anomaly("power", "warning",
+                                     f"Sleep blocked by: {names}. "
+                                     "Mac will not idle-sleep while these are active.",
+                                     len(user_blockers), 0))
+
+        display_blockers = [b for b in power.sleep_blockers
+                            if b.get("assertion_type") == "PreventUserIdleDisplaySleep"]
+        if display_blockers:
+            names = ", ".join(b.get("process", "?") for b in display_blockers)
+            anomalies.append(Anomaly("power", "info",
+                                     f"Display sleep blocked by: {names}.",
+                                     len(display_blockers), 0))
+
+        # USB/kernel wake assertions
+        wake_usb = [k for k in power.kernel_assertions if k.get("type") == "USB"]
+        if wake_usb:
+            devices = ", ".join(k.get("owner", "?") for k in wake_usb)
+            anomalies.append(Anomaly("power", "info",
+                                     f"USB devices holding wake assertions: {devices}. "
+                                     "These can prevent deep sleep.",
+                                     len(wake_usb), 0))
+
+        # Low sleep count relative to uptime
+        sleep_count = power.sleep_wake_stats.get("sleep_count", 0)
+        if stability and stability.uptime_hours and stability.uptime_hours > 24:
+            days_up = stability.uptime_hours / 24
+            if sleep_count == 0:
+                anomalies.append(Anomaly("power", "warning",
+                                         f"No sleep in {days_up:.1f} days of uptime. "
+                                         "Something is preventing sleep.",
+                                         0, 0))
+            elif sleep_count < days_up * 0.5:
+                anomalies.append(Anomaly("power", "info",
+                                         f"Only {sleep_count} sleep(s) in {days_up:.1f} days.",
+                                         sleep_count, 0))
 
     return anomalies

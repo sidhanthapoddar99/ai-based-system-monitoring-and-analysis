@@ -11,6 +11,7 @@ import psutil
 from modules.base import (
     SystemInfo, RamReport, CpuReport, TemperatureReport,
     DiskReport, ProcessReport, DisplayReport, StabilityReport,
+    PowerReport,
 )
 
 
@@ -279,4 +280,129 @@ def collect_stability() -> StabilityReport:
         thread_count=None,
         process_count=process_count,
         details={},
+    )
+
+
+def collect_power() -> PowerReport:
+    sleep_blockers = []
+    kernel_assertions = []
+    sleep_wake_stats = {}
+    power_settings = {}
+    recent_wake_events = []
+
+    # --- Power assertions (sleep blockers) ---
+    assertions_output = _run_cmd(["pmset", "-g", "assertions"], timeout=10)
+    if assertions_output:
+        current_section = "user"
+        for line in assertions_output.splitlines():
+            # Parse "Listed by owning process:" section
+            if "Listed by owning process:" in line:
+                current_section = "process"
+                continue
+            if "Kernel Assertions:" in line:
+                current_section = "kernel"
+                continue
+
+            if current_section == "process" and "pid " in line:
+                # e.g. pid 340(powerd): [0x...] 00:17:26 PreventUserIdleSystemSleep named: "..."
+                match = re.match(
+                    r'\s*pid\s+(\d+)\(([^)]+)\):\s+\[0x[0-9a-f]+\]\s+(\S+)\s+(\S+)\s+named:\s+"([^"]*)"',
+                    line,
+                )
+                if match:
+                    sleep_blockers.append({
+                        "pid": int(match.group(1)),
+                        "process": match.group(2),
+                        "duration": match.group(3),
+                        "assertion_type": match.group(4),
+                        "name": match.group(5),
+                    })
+
+            elif current_section == "kernel" and "id=" in line:
+                # e.g. id=589  level=255 0x4=USB creat= description=... owner=...
+                entry = {}
+                id_match = re.search(r"id=(\d+)", line)
+                if id_match:
+                    entry["id"] = int(id_match.group(1))
+                type_match = re.search(r"0x[0-9a-f]+=(\w+)", line)
+                if type_match:
+                    entry["type"] = type_match.group(1)
+                desc_match = re.search(r"description=(\S+)", line)
+                if desc_match:
+                    entry["description"] = desc_match.group(1)
+                owner_match = re.search(r"owner=(.+)$", line)
+                if owner_match:
+                    entry["owner"] = owner_match.group(1).strip()
+                if entry:
+                    kernel_assertions.append(entry)
+
+    # --- Sleep/wake stats ---
+    stats_output = _run_cmd(["pmset", "-g", "stats"], timeout=5)
+    if stats_output:
+        for line in stats_output.splitlines():
+            match = re.match(r"\s*([\w\s]+?)\s*:\s*(\d+)", line)
+            if match:
+                key = match.group(1).strip().lower().replace(" ", "_")
+                sleep_wake_stats[key] = int(match.group(2))
+
+    # --- Current power settings ---
+    pmset_output = _run_cmd(["pmset", "-g"], timeout=5)
+    if pmset_output:
+        for line in pmset_output.splitlines():
+            match = re.match(r"\s+(\w+)\s+(.+)", line)
+            if match:
+                key = match.group(1).strip()
+                val = match.group(2).strip()
+                # Strip trailing explanations like "(sleep prevented by ...)"
+                val_clean = re.sub(r"\s*\(.*\)\s*$", "", val)
+                try:
+                    power_settings[key] = int(val_clean)
+                except ValueError:
+                    power_settings[key] = val
+
+        # Capture sleep prevention note separately
+        for line in pmset_output.splitlines():
+            if "sleep prevented by" in line:
+                prevent_match = re.search(r"\(sleep prevented by (.+)\)", line)
+                if prevent_match:
+                    power_settings["sleep_prevented_by"] = prevent_match.group(1)
+
+    # --- Recent wake events from power log ---
+    log_output = _run_cmd(
+        ["pmset", "-g", "log"],
+        timeout=15,
+    )
+    if log_output:
+        for line in log_output.splitlines():
+            if "Wake" not in line and "Sleep" not in line:
+                continue
+            # Look for actual sleep/wake transitions
+            trans_match = re.match(
+                r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+(Sleep|Wake)\s+(.*)$",
+                line,
+            )
+            if trans_match:
+                recent_wake_events.append({
+                    "time": trans_match.group(1),
+                    "event": trans_match.group(2),
+                    "details": trans_match.group(3).strip()[:200],
+                })
+        # Keep only the last 20 events
+        recent_wake_events = recent_wake_events[-20:]
+
+    details = {}
+    # Capture which processes are currently blocking sleep
+    blocking = [b["process"] for b in sleep_blockers
+                if b.get("assertion_type") == "PreventUserIdleSystemSleep"
+                and b.get("process") != "powerd"]
+    if blocking:
+        details["sleep_blocked_by"] = blocking
+
+    return PowerReport(
+        sleep_blockers=sleep_blockers,
+        kernel_assertions=kernel_assertions,
+        sleep_wake_stats=sleep_wake_stats,
+        power_settings=power_settings,
+        recent_wake_events=recent_wake_events,
+        details=details,
     )
